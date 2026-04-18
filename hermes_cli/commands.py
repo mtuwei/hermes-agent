@@ -17,6 +17,7 @@ import subprocess
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 # prompt_toolkit is an optional CLI dependency — only needed for
@@ -845,6 +846,9 @@ class SlashCommandCompleter(Completer):
         self._file_cache: list[str] = []
         self._file_cache_time: float = 0.0
         self._file_cache_cwd: str = ""
+        # Cached user snippets for free-text autocomplete
+        self._snippets_cache: list[tuple[str, str]] = []
+        self._snippets_mtime: float = 0.0
 
     def _command_allowed(self, slash_command: str) -> bool:
         if self._command_filter is None:
@@ -853,6 +857,114 @@ class SlashCommandCompleter(Completer):
             return bool(self._command_filter(slash_command))
         except Exception:
             return True
+
+    # ------------------------------------------------------------------
+    # User snippets — free-text autocomplete from skill directory
+    # ------------------------------------------------------------------
+
+    _SNIPPETS_PATH = Path.home() / ".hermes" / "skills" / "devops" / "user-snippets-manager" / "snippets.yaml"
+    _SNIPPETS_TTL = 2.0  # re-read file at most every 2 seconds
+
+    def _load_snippets(self) -> list[tuple[str, str]]:
+        """Load snippets from ``~/.hermes/skills/devops/user-snippets-manager/snippets.yaml`` with simple caching.
+
+        Expected format (YAML)::
+
+            snippets:
+              - trigger: "规范提交"
+                body: "更新工作日志并规范提交"
+              - trigger: "检查改动"
+                body: "检查仓库改动"
+              # shorthand: trigger == body when only 'text' is given
+              - text: "帮我更新工作日志"
+
+        Each entry becomes a ``(display, body)`` tuple.  The *trigger* or
+        *text* key is used for fuzzy matching; *body* is what gets inserted.
+        """
+        try:
+            stat = self._SNIPPETS_PATH.stat()
+        except OSError:
+            return []
+
+        if self._snippets_cache and stat.st_mtime == self._snippets_mtime:
+            return self._snippets_cache
+
+        self._snippets_mtime = stat.st_mtime
+        snippets: list[tuple[str, str]] = []
+
+        try:
+            import yaml
+
+            with open(self._SNIPPETS_PATH, encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        except Exception:
+            # Fall back to simple line-based parsing if PyYAML unavailable
+            try:
+                lines = self._SNIPPETS_PATH.read_text(encoding="utf-8").splitlines()
+                for line in lines:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        snippets.append((line, line))
+            except Exception:
+                pass
+            self._snippets_cache = snippets
+            return snippets
+
+        for entry in data.get("snippets", []):
+            if isinstance(entry, str):
+                snippets.append((entry, entry))
+            elif isinstance(entry, dict):
+                trigger = entry.get("trigger") or entry.get("text", "")
+                body = entry.get("body", trigger)
+                if trigger:
+                    snippets.append((trigger, body))
+
+        self._snippets_cache = snippets
+        return snippets
+
+    def _snippet_completions(self, text: str, limit: int = 10):
+        """Yield ``Completion`` objects for matching user snippets.
+
+        Matches against the *full* current input text (not just the last word)
+        so multi-word triggers like ``规范提交`` work naturally.
+        Only triggers that would *extend* the current text are shown.
+        """
+        if not text or text.isspace():
+            return
+
+        snippets = self._load_snippets()
+        if not snippets:
+            return
+
+        scored: list[tuple[int, str, str]] = []
+        text_lower = text.lower()
+
+        for trigger, body in snippets:
+            t_lower = trigger.lower()
+            if t_lower == text_lower:
+                continue  # exact match — nothing to complete
+            if t_lower.startswith(text_lower):
+                scored.append((90, trigger, body))
+                continue
+            if text_lower in t_lower:
+                scored.append((60, trigger, body))
+                continue
+            # Substring of each word in trigger
+            words = t_lower.split()
+            if any(text_lower in w for w in words):
+                scored.append((40, trigger, body))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        for _score, trigger, body in scored[:limit]:
+            # Only offer if the body extends beyond what's already typed
+            remainder = body[len(text):]
+            if remainder:
+                yield Completion(
+                    body,
+                    start_position=-len(text),
+                    display=trigger,
+                    display_meta=remainder[:40],
+                )
 
     def _iter_skill_commands(self) -> Mapping[str, dict[str, Any]]:
         if self._skill_commands_provider is None:
@@ -1267,6 +1379,9 @@ class SlashCommandCompleter(Completer):
             path_word = self._extract_path_word(text)
             if path_word is not None:
                 yield from self._path_completions(path_word)
+                return
+            # Try user snippets for free-text autocomplete
+            yield from self._snippet_completions(text)
             return
 
         # Check if we're completing a subcommand (base command already typed)

@@ -1324,3 +1324,192 @@ class TestPluginCommandEnumeration:
         slack_names = set(slack_subcommand_map())
         assert "status" in tg_names
         assert "status" in slack_names
+# User snippets autocomplete tests
+# ---------------------------------------------------------------------------
+
+
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+
+class TestSnippetLoading:
+    """Tests for _load_snippets file reading and caching."""
+
+    def _make_completer(self, snippets_path: Path):
+        completer = SlashCommandCompleter()
+        completer._SNIPPETS_PATH = snippets_path
+        return completer
+
+    def test_missing_file_returns_empty(self, tmp_path):
+        completer = self._make_completer(tmp_path / "nonexistent.yaml")
+        assert completer._load_snippets() == []
+
+    def test_yaml_with_trigger_and_body(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "snippets:\n"
+            "  - trigger: '规范提交'\n"
+            "    body: '更新工作日志并规范提交'\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        result = completer._load_snippets()
+        assert result == [("规范提交", "更新工作日志并规范提交")]
+
+    def test_yaml_shorthand_text(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "snippets:\n"
+            "  - text: '帮我更新工作日志'\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        result = completer._load_snippets()
+        assert result == [("帮我更新工作日志", "帮我更新工作日志")]
+
+    def test_yaml_plain_string_entry(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "snippets:\n"
+            "  - '精简memory'\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        result = completer._load_snippets()
+        assert result == [("精简memory", "精简memory")]
+
+    def test_empty_snippets_key(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text("snippets: []\n", encoding="utf-8")
+        completer = self._make_completer(f)
+        assert completer._load_snippets() == []
+
+    def test_caching_same_mtime(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "snippets:\n"
+            "  - trigger: 'abc'\n"
+            "    body: 'abc def'\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        first = completer._load_snippets()
+        assert len(first) == 1
+        # File unchanged — should return cached result
+        second = completer._load_snippets()
+        assert second is first
+
+    def test_cache_invalidated_on_mtime_change(self, tmp_path):
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "snippets:\n"
+            "  - trigger: 'v1'\n"
+            "    body: 'version one'\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        first = completer._load_snippets()
+        # Rewrite file (changes mtime)
+        import time
+
+        time.sleep(0.05)
+        f.write_text(
+            "snippets:\n"
+            "  - trigger: 'v2'\n"
+            "    body: 'version two'\n",
+            encoding="utf-8",
+        )
+        second = completer._load_snippets()
+        assert second is not first
+        assert second == [("v2", "version two")]
+
+    def test_fallback_line_parsing_without_yaml(self, tmp_path):
+        """When PyYAML is unavailable, falls back to line-based parsing."""
+        f = tmp_path / "snippets.yaml"
+        f.write_text(
+            "# comment line\n"
+            "规范提交\n"
+            "精简memory\n"
+            "\n",
+            encoding="utf-8",
+        )
+        completer = self._make_completer(f)
+        with patch.dict("sys.modules", {"yaml": None}):
+            # Clear cache so it re-reads
+            completer._snippets_cache = []
+            result = completer._load_snippets()
+        assert result == [("规范提交", "规范提交"), ("精简memory", "精简memory")]
+
+
+class TestSnippetCompletions:
+    """Tests for _snippet_completions matching logic."""
+
+    def _make_completer(self, snippets):
+        completer = SlashCommandCompleter()
+        # Patch _load_snippets to return our test data
+        completer._load_snippets = lambda: snippets
+        return completer
+
+    def _get_completions(self, completer, text):
+        return list(completer._snippet_completions(text))
+
+    def test_empty_text_no_completions(self):
+        c = self._make_completer([("abc", "abc def")])
+        assert self._get_completions(c, "") == []
+
+    def test_whitespace_only_no_completions(self):
+        c = self._make_completer([("abc", "abc def")])
+        assert self._get_completions(c, "   ") == []
+
+    def test_no_snippets_no_completions(self):
+        c = self._make_completer([])
+        assert self._get_completions(c, "abc") == []
+
+    def test_exact_match_no_completion(self):
+        c = self._make_completer([("abc", "abc def")])
+        assert self._get_completions(c, "abc") == []
+
+    def test_prefix_match_high_score(self):
+        c = self._make_completer([
+            ("规范提交", "规范提交到仓库"),
+            ("检查改动", "检查仓库改动"),
+        ])
+        results = self._get_completions(c, "规范")
+        assert len(results) == 1
+        # display is FormattedText — extract plain text via list()[0][1]
+        assert list(results[0].display)[0][1] == "规范提交"
+
+    def test_substring_match_lower_score(self):
+        c = self._make_completer([("检查仓库改动", "检查仓库改动并提交")])
+        results = self._get_completions(c, "仓库")
+        assert len(results) == 1
+
+    def test_word_boundary_match_lowest_score(self):
+        c = self._make_completer([("update changelog", "update changelog and commit")])
+        results = self._get_completions(c, "change")
+        assert len(results) == 1
+
+    def test_case_insensitive(self):
+        c = self._make_completer([("UpdateLog", "UpdateLog and commit")])
+        results = self._get_completions(c, "update")
+        assert len(results) == 1
+
+    def test_limit_respected(self):
+        c = self._make_completer([
+            ("aaa", "aaa body"),
+            ("aab", "aab body"),
+            ("aac", "aac body"),
+        ])
+        results = self._get_completions(c, "a")
+        assert len(results) == 3
+        # With limit=1, should get only the highest-scored result
+        results_limited = list(c._snippet_completions("a", limit=1))
+        assert len(results_limited) == 1
+
+    def test_completion_text_replaces_input(self):
+        c = self._make_completer([("abc", "abcdef")])
+        results = self._get_completions(c, "ab")
+        assert len(results) == 1
+        assert results[0].text == "abcdef"
+        assert results[0].start_position == -2
